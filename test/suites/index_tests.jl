@@ -499,3 +499,130 @@ end
         @test_throws ArgumentError reshapemask((-1,), (-1,))
     end
 end
+
+@testitem "randommask" begin
+    using Random
+    using StableRNGs
+
+    rng = StableRNG(123)
+
+    @testset "reproducible bit mixing" begin
+        # Fixed outputs pin down the integer arithmetic and seed interpretation
+        # independently of Julia's built-in hash and platform word size.
+        @test Finch.randommask_mix(UInt64(0)) == 0xe220a8397b1dcdaf
+        @test Finch.randommask_mix(UInt64(1)) == 0x910a2dec89025cc1
+        @test Finch.randommask_mix(typemax(UInt64)) == 0xe4d971771b652c20
+        @test Finch.randommask_uniform(UInt64(0)) == 0.0
+        @test Finch.randommask_uniform(typemax(UInt64)) == prevfloat(1.0)
+        mask = randommask(16, 0.5; seed=42)
+        @test copyto!(zeros(Bool, 16), mask) ==
+            Bool[0, 1, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 1]
+        mask = randommask((4, 5), 0.5; seed=42)
+        @test copyto!(zeros(Bool, 4, 5), mask) == Bool[
+            1 0 1 0 0
+            0 1 0 0 1
+            0 1 0 1 0
+            0 1 0 0 0
+        ]
+    end
+
+    @testset "probabilities and shapes" begin
+        for shape in ((), (0,), (3, 0), (1,), (4, 5), (2, 3, 4)), p in (0, 1)
+            mask = randommask(rng, shape, p)
+            out = fill(!Bool(p), shape)
+            copyto!(out, mask)
+            @test out == fill(Bool(p), shape)
+            @test size(mask) == shape
+            @test eltype(mask) == Bool
+            @test Finch.fill_value(mask) == false
+        end
+        for shape in ((), (5,), (3, 4), (2, 3, 4))
+            mask = randommask(rng, shape, 0.3)
+            out = copyto!(zeros(Bool, shape), mask)
+            for i in CartesianIndices(shape)
+                @test out[i] == mask[Tuple(i)...]
+            end
+        end
+        for p in (0.1, 0.25, 0.5, 0.9)
+            sample = copyto!(zeros(Bool, 10000), randommask(10000, p; seed=42))
+            @test abs(count(sample) / length(sample) - p) < 0.03
+        end
+        @test randommask(3, 0.5) isa Finch.RandomMask
+    end
+
+    @testset "stable reads and traversal" begin
+        rng1 = StableRNG(456)
+        mask = randommask(rng1, (7, 9), 0.4)
+        same = randommask(StableRNG(456), (7, 9), 0.4)
+        rng_after_construction = copy(rng1)
+        @test mask.seed == same.seed
+        @test mask.seed != randommask(StableRNG(457), (7, 9), 0.4).seed
+        forward = copyto!(zeros(Bool, 7, 9), mask)
+        @test forward == copyto!(zeros(Bool, 7, 9), same)
+        @test forward == copyto!(zeros(Bool, 7, 9), randommask((7, 9), 0.4; seed=mask.seed))
+        reversed_loops = zeros(Bool, 7, 9)
+        @finch mode = :fast begin
+            reversed_loops .= false
+            for i in _, j in _
+                reversed_loops[i, j] = mask[i, j]
+            end
+        end
+        @test reversed_loops == forward
+        for i in 7:-1:1, j in 9:-1:1
+            @test mask[i, j] == forward[i, j]
+        end
+        sparse = copyto!(Tensor(Dense(SparseList(Element(false)))), mask)
+        @test Array(sparse) == forward
+        input = reshape(collect(1:63), 7, 9)
+        total = Scalar(0)
+        @finch begin
+            total .= 0
+            for j in _, i in _
+                if mask[i, j]
+                    total[] += input[i, j]
+                end
+            end
+        end
+        @test total() == sum(input[forward])
+        randommask(rng1, 10, 0.5; seed=42)
+        @test rand(rng1, UInt64) == rand(rng_after_construction, UInt64)
+        @test occursin("seed=", summary(mask))
+    end
+
+    @testset "coordinate hashing" begin
+        mask = randommask((64, 64), 0.5; seed=42)
+        out = copyto!(zeros(Bool, 64, 64), mask)
+        # Plain XOR of coordinates produces a symmetric matrix and a constant
+        # diagonal. Mixing between coordinates must avoid those artifacts.
+        @test out != transpose(out)
+        @test 12 < sum(out[i, i] for i in 1:64) < 52
+        @test out[:, 1] != out[:, 2]
+        @test out[:, 1] != .!out[:, 2]
+        larger = randommask((80, 90), 0.5; seed=42)
+        grown = copyto!(zeros(Bool, 80, 90), larger)
+        @test grown[1:64, 1:64] == out
+        # No allocation or linearization of a shape whose product exceeds UInt64.
+        large_shape = (typemax(Int), typemax(Int), 8)
+        huge = randommask(large_shape, 0.5; seed=42)
+        small = randommask((4, 5, 2), 0.5; seed=42)
+        @test size(huge) == large_shape
+        @test huge[3, 4, 2] == small[3, 4, 2]
+        @test huge[large_shape...] == randommask(large_shape, 0.5; seed=42)[large_shape...]
+        if Sys.WORD_SIZE == 64
+            # In particular, indices above the old field-size limit are usable.
+            large_index = Int(1) << 62
+            @test huge[large_index, large_index, 8] isa Bool
+        end
+    end
+
+    @testset "validation" begin
+        for p in (-0.1, 1.1, NaN, Inf, -Inf)
+            @test_throws ArgumentError randommask(rng, (2, 3), p)
+        end
+        @test_throws ArgumentError randommask(rng, (-1,), 0.5)
+        for seed in (-1, 0.5, big(2)^64)
+            @test_throws ArgumentError randommask(4, 0.5; seed=seed)
+        end
+        @test randommask(4, 0.5; seed=typemax(UInt64)).seed == typemax(UInt64)
+    end
+end

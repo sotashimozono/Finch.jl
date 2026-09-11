@@ -57,4 +57,5 @@ paritymask
 oddevenmergesortpartnermask
 oddevenmergesortlowermask
 reshapemask
+randommask
 ```

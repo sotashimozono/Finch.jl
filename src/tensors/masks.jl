@@ -1063,3 +1063,148 @@ function unfurl(ctx, arr::VirtualReshapeMaskSlice, ext, mode, proto::typeof(defa
         ])
     end
 end
+
+# SplitMix64's fixed-width mixing step, applied without mutable RNG state.
+# Sebastiano Vigna's public-domain implementation: https://prng.di.unimi.it/splitmix64.c
+function randommask_mix(x::UInt64)
+    x += 0x9e3779b97f4a7c15
+    x = xor(x, x >> 30) * 0xbf58476d1ce4e5b9
+    x = xor(x, x >> 27) * 0x94d049bb133111eb
+    xor(x, x >> 31)
+end
+
+randommask_uniform(h::UInt64) = Float64(h >> 11) * 0x1.0p-53
+
+struct RandomMask{D} <: AbstractTensor
+    shape::NTuple{D,Int}
+    p::Float64
+    seed::UInt64
+end
+
+Base.ndims(::RandomMask{D}) where {D} = D
+Base.ndims(::Type{RandomMask{D}}) where {D} = D
+Base.eltype(::RandomMask) = Bool
+Base.eltype(::Type{RandomMask{D}}) where {D} = Bool
+Base.size(tns::RandomMask) = tns.shape
+Base.axes(tns::RandomMask) = map(n -> 1:n, tns.shape)
+fill_value(::RandomMask) = false
+fill_value(::Type{RandomMask{D}}) where {D} = false
+
+"""
+    randommask([rng], shape, p; seed=nothing)
+
+A Boolean mask with reproducible random-looking entries and an approximate true
+fraction of `p`. `shape` is a tuple of nonnegative dimensions, or an integer for
+a vector. An empty tuple gives a scalar. The probability is stored as `Float64`
+and must lie in `[0, 1]`; `p = 0` and `p = 1` give constant masks.
+
+The mask starts with a mixed 64-bit seed, then XORs in each one-based coordinate
+and mixes again, from the last axis to the first. The high 53 bits of the result
+are converted to a value in `[0, 1)` and compared with `p`. This is a pseudorandom
+hash construction; it does not promise n-wise independence.
+Each read specializes into separate true and false branches.
+
+Reads consume no randomness and are independent of traversal order. The same
+seed and coordinates give the same entry even when the shape changes. There is
+no limit on the product of the dimensions, since coordinates are never flattened.
+Only the shape, probability, and one seed are stored.
+
+Pass `seed` as an integer in `[0, typemax(UInt64)]` to reproduce a mask directly.
+If omitted, one seed is drawn from `rng` (the default RNG if omitted).
+
+For example, `mask = randommask((100, 200), 0.1; seed=42)` creates a matrix mask
+that can be read as `mask[i, j]` inside `@finch`.
+"""
+randommask(shape, p; seed=nothing) = randommask(default_rng(), shape, p; seed=seed)
+function randommask(rng::AbstractRNG, shape::Integer, p::Real; seed=nothing)
+    randommask(rng, (shape,), p; seed=seed)
+end
+function randommask(rng::AbstractRNG, shape::Tuple{Vararg{Integer}}, p::Real; seed=nothing)
+    0 <= p <= 1 || throw(ArgumentError("probability must lie in [0, 1]"))
+    shape = map(Int, shape)
+    all(d -> d >= 0, shape) || throw(ArgumentError("shape dimensions must be nonnegative"))
+    if seed === nothing
+        seed = rand(rng, UInt64)
+    else
+        seed isa Integer && 0 <= seed <= typemax(UInt64) ||
+            throw(ArgumentError("seed must be an integer in [0, typemax(UInt64)]"))
+        seed = UInt64(seed)
+    end
+    RandomMask(shape, Float64(p), seed)
+end
+
+function Base.summary(io::IO, ex::RandomMask)
+    print(io, "randommask(", ex.shape, ", ", ex.p, "; seed=", ex.seed, ")")
+end
+
+struct VirtualRandomMask <: AbstractVirtualTensor
+    shape
+    p
+    seed
+end
+
+function virtualize(ctx, ex, ::Type{RandomMask{D}}) where {D}
+    shape = ntuple(D) do d
+        dim = freshen(ctx, :random_dim)
+        push_preamble!(ctx, :($dim = $ex.shape[$d]))
+        value(dim, Int)
+    end
+    p = freshen(ctx, :p)
+    seed = freshen(ctx, :seed)
+    push_preamble!(
+        ctx,
+        quote
+            $p = $ex.p
+            $seed = $ex.seed
+        end,
+    )
+    VirtualRandomMask(shape, value(p, Float64), value(seed, UInt64))
+end
+
+FinchNotation.finch_leaf(x::VirtualRandomMask) = virtual(x)
+function virtual_size(ctx, arr::VirtualRandomMask)
+    map(n -> VirtualExtent(literal(1), n), arr.shape)
+end
+virtual_fill_value(ctx, ::VirtualRandomMask) = false
+virtual_eltype(ctx, ::VirtualRandomMask) = Bool
+
+function instantiate(ctx, arr::VirtualRandomMask, mode)
+    if isempty(arr.shape)
+        Switch([
+            call(<, call(randommask_uniform, call(randommask_mix, arr.seed)), arr.p) =>
+                FillLeaf(true),
+            literal(true) => FillLeaf(false),
+        ])
+    else
+        arr
+    end
+end
+
+struct VirtualRandomMaskSlice
+    ndims::Int
+    p
+    state
+end
+
+FinchNotation.finch_leaf(x::VirtualRandomMaskSlice) = virtual(x)
+
+function unfurl(ctx, arr::VirtualRandomMask, ext, mode, proto::typeof(defaultread))
+    slice = VirtualRandomMaskSlice(length(arr.shape), arr.p, call(randommask_mix, arr.seed))
+    Unfurled(; arr=arr, body=unfurl(ctx, slice, ext, mode, proto))
+end
+
+function unfurl(ctx, arr::VirtualRandomMaskSlice, ext, mode, proto::typeof(defaultread))
+    Lookup(;
+        body=(ctx, i) -> begin
+            state = call(randommask_mix, call(xor, arr.state, call(UInt64, i)))
+            if arr.ndims == 1
+                Switch([
+                    call(<, call(randommask_uniform, state), arr.p) => FillLeaf(true),
+                    literal(true) => FillLeaf(false),
+                ])
+            else
+                VirtualRandomMaskSlice(arr.ndims - 1, arr.p, state)
+            end
+        end,
+    )
+end
