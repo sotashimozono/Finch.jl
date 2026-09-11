@@ -1098,10 +1098,11 @@ fraction of `p`. `shape` is a tuple of nonnegative dimensions, or an integer for
 a vector. An empty tuple gives a scalar. The probability is stored as `Float64`
 and must lie in `[0, 1]`; `p = 0` and `p = 1` give constant masks.
 
-The mask starts with a mixed 64-bit seed, then XORs in each one-based coordinate
-and mixes again, from the last axis to the first. The high 53 bits of the result
+An indexed mask starts with a mixed 64-bit seed, then XORs in each one-based
+coordinate and mixes again, from the last axis to the first. The high 53 bits of the result
 are converted to a value in `[0, 1)` and compared with `p`. This is a pseudorandom
 hash construction; it does not promise n-wise independence.
+Scalar masks convert the seed directly to a value in `[0, 1)` and compare with `p`.
 Each read specializes into separate true and false branches.
 
 Reads consume no randomness and are independent of traversal order. The same
@@ -1171,7 +1172,7 @@ virtual_eltype(ctx, ::VirtualRandomMask) = Bool
 function instantiate(ctx, arr::VirtualRandomMask, mode)
     if isempty(arr.shape)
         Switch([
-            call(<, call(randommask_uniform, call(randommask_mix, arr.seed)), arr.p) =>
+            call(<, call(randommask_uniform, arr.seed), arr.p) =>
                 FillLeaf(true),
             literal(true) => FillLeaf(false),
         ])
