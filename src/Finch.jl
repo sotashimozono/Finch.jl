@@ -52,6 +52,8 @@ export Scalar, SparseScalar, ShortCircuitScalar, SparseShortCircuitScalar
 export walk, gallop, follow, extrude, laminate
 export Tensor, pattern!, dropfills, dropfills!, set_fill_value!
 export diagmask, lotrimask, uptrimask, bandmask, splitmask, chunkmask
+export pairsummask, paircarrymask, reversemask, rollmask, repeatmask, onehotmask, paritymask
+export oddevenmergesortpartnermask, oddevenmergesortlowermask, reshapemask
 export scale, products, offset, permissive, protocolize, swizzle, toeplitz, window
 export PlusOneVector
 

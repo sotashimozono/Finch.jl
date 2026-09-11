@@ -47,4 +47,14 @@ diagmask
 bandmask
 splitmask
 chunkmask
+pairsummask
+paircarrymask
+reversemask
+rollmask
+repeatmask
+onehotmask
+paritymask
+oddevenmergesortpartnermask
+oddevenmergesortlowermask
+reshapemask
 ```

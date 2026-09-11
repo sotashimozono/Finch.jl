@@ -347,3 +347,155 @@
         end)
     end
 end
+
+@testitem "masks" begin
+    function mask_matrix(mask, m, n; rows=1:m)
+        out = Tensor(Dense(SparseList(Element(false))), m, n)
+        start = first(rows)
+        stop = last(rows)
+        @finch begin
+            out .= false
+            for j in 1:n, i in 1:m
+                if start <= i <= stop
+                    out[i, j] = mask[i, j]
+                end
+            end
+        end
+        Array(out)
+    end
+
+    function mask_vector(mask, n; rows=1:n)
+        out = Tensor(SparseList(Element(false)), n)
+        start = first(rows)
+        stop = last(rows)
+        @finch begin
+            out .= false
+            for i in 1:n
+                if start <= i <= stop
+                    out[i] = mask[i]
+                end
+            end
+        end
+        Array(out)
+    end
+
+    @testset "pair sums and carries" begin
+        for n in (0, 1, 2, 7, 8)
+            pairs = mask_matrix(pairsummask, cld(n, 2), n)
+            carries = mask_matrix(paircarrymask, n, fld(n, 2))
+            input = collect(1:n)
+            @test pairs * input == [sum(input[i:min(i + 1, n)]) for i in 1:2:n]
+            partial = collect(1:fld(n, 2))
+            @test carries * partial == [i == 1 ? 0 : partial[fld(i, 2)] for i in 1:n]
+        end
+    end
+
+    @testset "reverse, roll, and repeat" begin
+        for n in (0, 1, 7), m in (0, 1, 5, 15)
+            @test mask_matrix(reversemask(n), m, n) ==
+                [j == n - i + 1 for i in 1:m, j in 1:n]
+            for k in (-10, -1, 0, 1, 10)
+                rolled = mask_matrix(rollmask(n, k), m, n)
+                @test rolled == [n > 0 && j - 1 == mod(i - 1 - k, n) for i in 1:m, j in 1:n]
+                if m == n
+                    @test rolled * collect(1:n) == circshift(collect(1:n), k)
+                end
+            end
+        end
+        for k in (-1, 0, 1, 3), n in (0, 1, 5)
+            repeated = mask_matrix(repeatmask(k), max(k, 0) * n, n)
+            @test repeated * collect(1:n) == repeat(collect(1:n); inner=max(k, 0))
+        end
+        @test mask_matrix(repeatmask(0), 5, 3) == falses(5, 3)
+        @test mask_matrix(repeatmask(-2), 5, 3) == falses(5, 3)
+        @test mask_matrix(repeatmask(3), 7, 3) * [4, 5, 6] == [4, 4, 4, 5, 5, 5, 6]
+        @test mask_matrix(rollmask(3, -1), 9, 3; rows=4:8) ==
+            [4 <= i <= 8 && j == mod(i, 3) + 1 for i in 1:9, j in 1:3]
+    end
+
+    @testset "one-hot and parity" begin
+        for n in (0, 1, 7), index in (-1, 0, 1, 3, 8)
+            @test mask_vector(onehotmask(index), n) == [i == index for i in 1:n]
+        end
+        for n in (0, 1, 7), parity in (-1, 0, 1, 2)
+            @test mask_vector(paritymask(parity), n) ==
+                [mod(i - 1, 2) == parity for i in 1:n]
+        end
+        @test mask_vector(paritymask(), 9; rows=4:8) ==
+            [false, false, false, false, true, false, true, false, false]
+        @test mask_vector(paritymask(1), 9; rows=3:7) ==
+            [false, false, false, true, false, true, false, false, false]
+    end
+
+    @testset "odd-even merge sort" begin
+        for n in (0, 1, 2, 3, 7, 8, 13, 16)
+            input = collect(n:-1:1)
+            p = 1
+            while p < n
+                k = p
+                while k >= 1
+                    # Enumerate compare-exchanges as in the sorting network, using
+                    # zero-based positions independently of the mask implementation.
+                    partners = collect(1:n)
+                    lower = falses(n)
+                    for j in mod(k, p):(2k):(n - k - 1), i in 0:(k - 1)
+                        a = i + j
+                        b = a + k
+                        if b < n && fld(a, 2p) == fld(b, 2p)
+                            partners[a + 1] = b + 1
+                            partners[b + 1] = a + 1
+                            lower[a + 1] = true
+                        end
+                    end
+                    mask = mask_matrix(oddevenmergesortpartnermask(n, p, k), n, n)
+                    @test mask_vector(oddevenmergesortlowermask(n, p, k), n) == lower
+                    @test mask == [j == partners[i] for i in 1:n, j in 1:n]
+                    partner_values = mask * input
+                    input =
+                        ifelse.(
+                            lower, min.(input, partner_values), max.(input, partner_values)
+                        )
+                    k = fld(k, 2)
+                end
+                p *= 2
+            end
+            @test input == collect(1:n)
+        end
+        @test mask_matrix(oddevenmergesortpartnermask(0, 1, 1), 0, 0) == falses(0, 0)
+        @test mask_vector(oddevenmergesortlowermask(0, 1, 1), 0) == Bool[]
+        @test_throws ArgumentError oddevenmergesortpartnermask(5, 0, 1)
+        @test_throws ArgumentError oddevenmergesortlowermask(5, 1, 0)
+    end
+
+    @testset "reshape" begin
+        for (old_shape, new_shape) in (
+            ((2, 3), (3, 2)),
+            ((6,), (2, 3)),
+            ((2, 3), (6,)),
+            ((1, 2, 3), (3, 2)),
+            ((0, 3), (2, 0)),
+            ((2, 0), (0,)),
+            ((), ()),
+            ((), (1, 1)),
+            ((1, 1), ()),
+        )
+            mask = reshapemask(old_shape, new_shape)
+            out = zeros(Bool, size(mask))
+            copyto!(out, mask)
+            # Reversing the dimensions makes Julia's column-major indexing
+            # enumerate the source pattern's row-major positions.
+            old_indices = LinearIndices(reverse(old_shape))
+            new_indices = LinearIndices(reverse(new_shape))
+            expected = zeros(Bool, size(mask))
+            for old in CartesianIndices(old_shape), new in CartesianIndices(new_shape)
+                expected[Tuple(old)..., Tuple(new)...] =
+                    old_indices[reverse(Tuple(old))...] ==
+                    new_indices[reverse(Tuple(new))...]
+            end
+            @test out == expected
+            @test count(out) == prod(old_shape)
+        end
+        @test_throws DimensionMismatch reshapemask((2, 3), (5,))
+        @test_throws ArgumentError reshapemask((-1,), (-1,))
+    end
+end
